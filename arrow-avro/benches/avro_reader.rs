@@ -130,7 +130,8 @@ fn read_avro_test_file(
         Field::new("int_field", DataType::Int32, false),
     ]));
 
-    RecordBatch::try_new(schema, vec![string_array, int_array])
+    let result = RecordBatch::try_new(schema, vec![string_array, int_array]);
+    result
 }
 
 fn bench_array_creation(c: &mut Criterion) {

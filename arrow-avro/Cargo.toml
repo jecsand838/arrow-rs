@@ -44,6 +44,9 @@ md5 = ["dep:md5"]
 sha256 = ["dep:sha2"]
 small_decimals = []
 avro_custom_types = []
+bench-arrow2 = []
+bench-alloc = []
+alloc_counts = []
 
 [dependencies]
 arrow-schema = { workspace = true }
@@ -68,20 +71,24 @@ sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 arrow-data = { workspace = true }
+arrow = { workspace = true }
 rand = { version = "0.9.1", default-features = false, features = [
     "std",
     "std_rng",
     "thread_rng",
 ] }
-criterion = { version = "0.7.0", default-features = false }
+criterion = { version = "0.7.0", features = ["html_reports"] }
 tempfile = "3.3"
-arrow = { workspace = true }
 futures = "0.3.31"
 bytes = "1.10.1"
 async-stream = "0.3.6"
 apache-avro = "0.20.0"
 num-bigint = "0.4"
 once_cell = "1.21.3"
+pprof = { version = "0.15", features = ["flamegraph", "criterion"] }
+allocation-counter = { version = "0.8"}
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bench]]
 name = "avro_reader"
@@ -93,4 +100,12 @@ harness = false
 
 [[bench]]
 name = "avro_writer"
+harness = false
+
+[[bench]]
+name = "compare_readers"
+harness = false
+
+[[bench]]
+name = "compare_writers"
 harness = false
