@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::compression::{CODEC_METADATA_KEY, CompressionCodec};
-use crate::schema::{AvroSchema, SCHEMA_METADATA_KEY};
+use crate::schema::{AvroSchema, AvroSchemaOptions, SCHEMA_METADATA_KEY};
 use crate::writer::encoder::write_long;
 use arrow_schema::{ArrowError, Schema};
 use rand::RngCore;
@@ -63,7 +63,13 @@ impl AvroFormat for AvroOcfFormat {
         // Choose the Avro schema JSON that the file will advertise.
         // If `schema.metadata[SCHEMA_METADATA_KEY]` exists, AvroSchema::try_from
         // uses it verbatim; otherwise it is generated from the Arrow schema.
-        let avro_schema = AvroSchema::try_from(schema)?;
+        let avro_schema = AvroSchema::from_arrow_with_options(
+            schema,
+            Some(AvroSchemaOptions {
+                null_order: None,
+                strip_metadata: true,
+            }),
+        )?;
         // Magic
         writer
             .write_all(b"Obj\x01")

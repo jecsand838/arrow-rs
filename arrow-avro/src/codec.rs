@@ -901,7 +901,7 @@ fn parse_decimal_attributes(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr)]
 #[strum(serialize_all = "snake_case")]
-enum UnionFieldKind {
+pub(crate) enum UnionFieldKind {
     Null,
     Boolean,
     Int,
@@ -1399,7 +1399,13 @@ impl<'a> Maker<'a> {
                     (Some("local-timestamp-micros"), c @ Codec::Int64) => {
                         *c = Codec::TimestampMicros(false)
                     }
-                    (Some("uuid"), c @ Codec::Utf8) => *c = Codec::Uuid,
+                    (Some("uuid"), c @ Codec::Utf8) => {
+                        // Map Avro string+logicalType=uuid into the UUID codec,
+                        // and *preserve* the logicalType in Arrow field metadata
+                        // so writers can round-trip it correctly.
+                        *c = Codec::Uuid;
+                        field.metadata.insert("logicalType".into(), "uuid".into());
+                    }
                     #[cfg(feature = "avro_custom_types")]
                     (Some("arrow.duration-nanos"), c @ Codec::Int64) => *c = Codec::DurationNanos,
                     #[cfg(feature = "avro_custom_types")]

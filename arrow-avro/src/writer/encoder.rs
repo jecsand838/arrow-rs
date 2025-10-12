@@ -39,9 +39,10 @@ use arrow_buffer::{ArrowNativeType, NullBuffer};
 use arrow_schema::{
     ArrowError, DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit, UnionMode,
 };
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use uuid::Uuid;
+use uuid::Uuid; // <-- NEW: for type_id -> branch index mapping
 
 /// Encode a single Avro-`long` using ZigZag + variable length, buffered.
 ///
@@ -788,6 +789,11 @@ impl FieldPlan {
                 value_plan: Box::new(FieldPlan::build(value_site_dt, values_field.as_ref())?),
             });
         }
+        println!(
+            "\nCHECK FIELD PLAN BUILD field={:?} codec={:?}\n",
+            arrow_field,
+            avro_dt.codec()
+        );
         if let DataType::FixedSizeBinary(len) = arrow_field.data_type() {
             // Extension-based detection (only when the feature is enabled)
             let ext_is_uuid = {
@@ -808,6 +814,10 @@ impl FieldPlan {
                 .get("logicalType")
                 .map(|s| s.as_str())
                 == Some("uuid");
+            println!(
+                "-----CHECK FIELD PLAN BUILD UUID md={:?} ext={:?}\n\n",
+                md_is_uuid, ext_is_uuid
+            );
             if ext_is_uuid || md_is_uuid {
                 if *len != 16 {
                     return Err(ArrowError::InvalidArgumentError(
@@ -845,14 +855,36 @@ impl FieldPlan {
                 Ok(FieldPlan::Struct { bindings })
             }
             Codec::List(items_dt) => match arrow_field.data_type() {
-                DataType::List(field_ref) => Ok(FieldPlan::List {
-                    items_nullability: items_dt.nullability(),
-                    item_plan: Box::new(FieldPlan::build(items_dt.as_ref(), field_ref.as_ref())?),
-                }),
-                DataType::LargeList(field_ref) => Ok(FieldPlan::List {
-                    items_nullability: items_dt.nullability(),
-                    item_plan: Box::new(FieldPlan::build(items_dt.as_ref(), field_ref.as_ref())?),
-                }),
+                DataType::List(field_ref) => {
+                    eprintln!(
+                        "[plan::list] field='{}' items_nullable={:?} item_is_union={}",
+                        arrow_field.name(),
+                        items_dt.nullability(),
+                        matches!(items_dt.codec(), crate::codec::Codec::Union(..))
+                    );
+                    Ok(FieldPlan::List {
+                        items_nullability: items_dt.nullability(),
+                        item_plan: Box::new(FieldPlan::build(
+                            items_dt.as_ref(),
+                            field_ref.as_ref(),
+                        )?),
+                    })
+                }
+                DataType::LargeList(field_ref) => {
+                    eprintln!(
+                        "[plan::large_list] field='{}' items_nullable={:?} item_is_union={}",
+                        arrow_field.name(),
+                        items_dt.nullability(),
+                        matches!(items_dt.codec(), crate::codec::Codec::Union(..))
+                    );
+                    Ok(FieldPlan::List {
+                        items_nullability: items_dt.nullability(),
+                        item_plan: Box::new(FieldPlan::build(
+                            items_dt.as_ref(),
+                            field_ref.as_ref(),
+                        )?),
+                    })
+                }
                 other => Err(ArrowError::SchemaError(format!(
                     "Avro array maps to Arrow List/LargeList, found: {other:?}"
                 ))),
@@ -880,6 +912,13 @@ impl FieldPlan {
                     })?;
                 let value_field = entries_struct_fields[value_idx].as_ref();
                 let value_plan = FieldPlan::build(values_dt.as_ref(), value_field)?;
+                eprintln!(
+                    "[plan::map] field='{}' items_nullable={:?} item_is_union={}",
+                    arrow_field.name(),
+                    values_dt.nullability(),
+                    matches!(values_dt.codec(), crate::codec::Codec::Union(..))
+                );
+
                 Ok(FieldPlan::Map {
                     values_nullability: values_dt.nullability(),
                     value_plan: Box::new(value_plan),
@@ -962,6 +1001,16 @@ impl FieldPlan {
                         arrow_field.name()
                     )));
                 }
+                let arrow_ids: Vec<i8> = arrow_union_fields.iter().map(|(id, _)| id).collect();
+                eprintln!(
+                    "[plan::union] field='{}' arrow_type_ids={:?} avro_branches={:?}",
+                    arrow_field.name(),
+                    arrow_ids,
+                    avro_branches
+                        .iter()
+                        .map(|b| crate::codec::UnionFieldKind::from(b.codec()))
+                        .collect::<Vec<_>>()
+                );
                 let bindings = avro_branches
                     .iter()
                     .zip(arrow_union_fields.iter())
@@ -1287,13 +1336,22 @@ impl EnumEncoder<'_> {
     }
 }
 
+/// Union encoder:
+/// * Stores per-branch encoders **in Avro branch order** (schema order).
+/// * Maintains a mapping from Arrow **type_id** → **Avro branch index**.
 struct UnionEncoder<'a> {
     encoders: Vec<FieldEncoder<'a>>,
     array: &'a UnionArray,
+    typeid_to_branch: HashMap<i8, usize>,
 }
 
 impl<'a> UnionEncoder<'a> {
     fn try_new(array: &'a UnionArray, field_bindings: &[FieldBinding]) -> Result<Self, ArrowError> {
+        eprintln!(
+            "[union-try_new] avro_order=0..{} (bindings.len())",
+            field_bindings.len()
+        );
+
         let DataType::Union(fields, UnionMode::Dense) = array.data_type() else {
             return Err(ArrowError::SchemaError("Expected Dense UnionArray".into()));
         };
@@ -1305,14 +1363,19 @@ impl<'a> UnionEncoder<'a> {
                 field_bindings.len()
             )));
         }
+
+        // Build encoders in **Avro branch order** and a map from Arrow type_id -> Avro branch index.
         let mut encoders = Vec::with_capacity(fields.len());
-        for (type_id, field_ref) in fields.iter() {
+        let mut typeid_to_branch = HashMap::with_capacity(fields.len());
+
+        for (branch_idx, (type_id, field_ref)) in fields.iter().enumerate() {
             let binding = field_bindings
-                .get(type_id as usize)
+                .get(branch_idx)
                 .ok_or_else(|| ArrowError::SchemaError("Binding and field mismatch".to_string()))?;
 
-            let child = array.child(type_id).as_ref();
+            typeid_to_branch.insert(type_id, branch_idx);
 
+            let child = array.child(type_id).as_ref();
             let encoder = prepare_value_site_encoder(
                 child,
                 field_ref.as_ref(),
@@ -1321,20 +1384,31 @@ impl<'a> UnionEncoder<'a> {
             )?;
             encoders.push(encoder);
         }
-        Ok(Self { encoders, array })
+        eprintln!("[union-try_new] type_id -> branch: {:?}", typeid_to_branch);
+
+        Ok(Self {
+            encoders,
+            array,
+            typeid_to_branch,
+        })
     }
 
     fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
+        // Arrow DenseUnion stores a type_id per row; Avro requires the *branch index* in schema order.
         let type_id = self.array.type_ids()[idx];
-        let branch_index = type_id as usize;
-        write_int(out, type_id as i32)?;
+        let branch_index = *self.typeid_to_branch.get(&type_id).ok_or_else(|| {
+            ArrowError::SchemaError(format!("Union type_id {type_id} not present in schema"))
+        })?;
+        write_int(out, branch_index as i32)?;
+
         let child_row = self.array.value_offset(idx);
-
-        let encoder = self
-            .encoders
-            .get_mut(branch_index)
-            .ok_or_else(|| ArrowError::SchemaError(format!("Invalid type_id {type_id}")))?;
-
+        eprintln!(
+            "[union-encode] row={} type_id={} -> branch_index={} value_offset={}",
+            idx, type_id, branch_index, child_row
+        );
+        let encoder = self.encoders.get_mut(branch_index).ok_or_else(|| {
+            ArrowError::SchemaError(format!("Invalid branch index {branch_index}"))
+        })?;
         encoder.encode(out, child_row)
     }
 }
@@ -1491,11 +1565,12 @@ impl FixedEncoder<'_> {
     }
 }
 
-/// Avro UUID logical type encoder: Arrow FixedSizeBinary(16) → Avro string (UUID).
+/// Avro UUID logical type encoder: Arrow FixedSizeBinary(16) to Avro string (UUID).
 /// Spec: uuid is a logical type over string (RFC‑4122). We output hyphenated form.
 struct UuidEncoder<'a>(&'a FixedSizeBinaryArray);
 impl UuidEncoder<'_> {
     fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
+        println!("writing UUID");
         let mut buf = [0u8; 1 + uuid::fmt::Hyphenated::LENGTH];
         buf[0] = 0x48;
         let v = self.0.value(idx);
