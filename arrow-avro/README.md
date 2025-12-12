@@ -44,14 +44,14 @@ This crate provides:
 
 ```toml
 [dependencies]
-arrow-avro = "57.0.0"
+arrow-avro = "58.0.0"
 ````
 
 Disable defaults and pick only what you need (see **Feature Flags**):
 
 ```toml
 [dependencies]
-arrow-avro = { version = "57.0.0", default-features = false, features = ["deflate", "snappy"] }
+arrow-avro = { version = "58.0.0", default-features = false, features = ["deflate", "snappy"] }
 ```
 
 ---
@@ -149,17 +149,17 @@ See the crate docs for runnable SOE and Confluent round‑trip examples.
 * Minimal, fast build (common pipelines):
 
   ```toml
-  arrow-avro = { version = "56", default-features = false, features = ["deflate", "snappy"] }
+  arrow-avro = { version = "58", default-features = false, features = ["deflate", "snappy"] }
   ```
 * Include Zstandard too (modern data lakes):
 
   ```toml
-  arrow-avro = { version = "56", default-features = false, features = ["deflate", "snappy", "zstd"] }
+  arrow-avro = { version = "58", default-features = false, features = ["deflate", "snappy", "zstd"] }
   ```
 * Fingerprint helpers:
 
   ```toml
-  arrow-avro = { version = "56", features = ["md5", "sha256"] }
+  arrow-avro = { version = "58", features = ["md5", "sha256"] }
   ```
   
 ---

@@ -20,7 +20,7 @@
 //! This crate provides:
 //! - a [`reader`] that decodes Avro (Object Container Files, Avro Single‑Object encoding,
 //!   and Confluent Schema Registry wire format) into Arrow `RecordBatch`es,
-//! - and a [`writer`] that encodes Arrow `RecordBatch`es into Avro (OCF or SOE).
+//! - and a [`writer`] that encodes Arrow `RecordBatch`es into Avro (OCF, SOE, or Binary).
 //!
 //! If you’re new to Arrow or Avro, see:
 //! - Arrow project site: <https://arrow.apache.org/>
@@ -128,7 +128,7 @@
 //! ### Modules
 //!
 //! - [`reader`]: read Avro (OCF, SOE, Confluent) into Arrow `RecordBatch`es.
-//! - [`writer`]: write Arrow `RecordBatch`es as Avro (OCF, SOE, Confluent, Apicurio).
+//! - [`writer`]: write Arrow `RecordBatch`es as Avro (OCF, SOE, Binary, Confluent, Apicurio).
 //! - [`schema`]: Avro schema parsing / fingerprints / registries.
 //! - [`compression`]: codecs used for **OCF block compression** (i.e., Deflate, Snappy, Zstandard, BZip2, and XZ).
 //! - [`codec`]: internal Avro-Arrow type conversion and row decode/encode plans.

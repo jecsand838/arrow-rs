@@ -826,6 +826,40 @@ impl RecordEncoder {
         }
         Ok(())
     }
+
+    pub(crate) fn encode_rows(
+        &self,
+        batch: &RecordBatch,
+        row_capacity: usize,
+        out_rows: &mut Vec<Vec<u8>>,
+    ) -> Result<(), ArrowError> {
+        let mut column_encoders = self.prepare_for_batch(batch)?;
+        let n = batch.num_rows();
+        out_rows.reserve(n);
+        match self.prefix {
+            Some(prefix) => {
+                let prefix_bytes = prefix.as_slice();
+                for row in 0..n {
+                    let mut buf = Vec::with_capacity(row_capacity);
+                    buf.extend_from_slice(prefix_bytes);
+                    for enc in column_encoders.iter_mut() {
+                        enc.encode(&mut buf, row)?;
+                    }
+                    out_rows.push(buf);
+                }
+            }
+            None => {
+                for row in 0..n {
+                    let mut buf = Vec::with_capacity(row_capacity);
+                    for enc in column_encoders.iter_mut() {
+                        enc.encode(&mut buf, row)?;
+                    }
+                    out_rows.push(buf);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn find_struct_child_index(fields: &arrow_schema::Fields, name: &str) -> Option<usize> {
@@ -3041,5 +3075,200 @@ mod tests {
             }
             other => panic!("expected NullableNoNulls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn encode_rows_single_column_int32() {
+        let schema = ArrowSchema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let arr = Int32Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)]).unwrap();
+        let encoder = RecordEncoder {
+            columns: vec![FieldBinding {
+                arrow_index: 0,
+                nullability: None,
+                plan: FieldPlan::Scalar,
+            }],
+            prefix: None,
+        };
+        let mut out_rows: Vec<Vec<u8>> = Vec::new();
+        encoder.encode_rows(&batch, 16, &mut out_rows).unwrap();
+        assert_eq!(out_rows.len(), 3);
+        assert_bytes_eq(&out_rows[0], &avro_long_bytes(1));
+        assert_bytes_eq(&out_rows[1], &avro_long_bytes(2));
+        assert_bytes_eq(&out_rows[2], &avro_long_bytes(3));
+    }
+
+    #[test]
+    fn encode_rows_multiple_columns() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]);
+        let int_arr = Int32Array::from(vec![10, 20]);
+        let str_arr = StringArray::from(vec!["hello", "world"]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(int_arr), Arc::new(str_arr)],
+        )
+        .unwrap();
+        let encoder = RecordEncoder {
+            columns: vec![
+                FieldBinding {
+                    arrow_index: 0,
+                    nullability: None,
+                    plan: FieldPlan::Scalar,
+                },
+                FieldBinding {
+                    arrow_index: 1,
+                    nullability: None,
+                    plan: FieldPlan::Scalar,
+                },
+            ],
+            prefix: None,
+        };
+        let mut out_rows: Vec<Vec<u8>> = Vec::new();
+        encoder.encode_rows(&batch, 32, &mut out_rows).unwrap();
+        assert_eq!(out_rows.len(), 2);
+        let mut expected_row0 = Vec::new();
+        expected_row0.extend(avro_long_bytes(10));
+        expected_row0.extend(avro_len_prefixed_bytes(b"hello"));
+        assert_bytes_eq(&out_rows[0], &expected_row0);
+        let mut expected_row1 = Vec::new();
+        expected_row1.extend(avro_long_bytes(20));
+        expected_row1.extend(avro_len_prefixed_bytes(b"world"));
+        assert_bytes_eq(&out_rows[1], &expected_row1);
+    }
+
+    #[test]
+    fn encode_rows_with_prefix() {
+        use crate::codec::AvroFieldBuilder;
+        use crate::schema::AvroSchema;
+        let schema = ArrowSchema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let arr = Int32Array::from(vec![42]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)]).unwrap();
+        let avro_schema = AvroSchema::try_from(&schema).unwrap();
+        let fingerprint = avro_schema
+            .fingerprint(crate::schema::FingerprintAlgorithm::Rabin)
+            .unwrap();
+        let avro_root = AvroFieldBuilder::new(&avro_schema.schema().unwrap())
+            .build()
+            .unwrap();
+        let encoder = RecordEncoderBuilder::new(&avro_root, &schema)
+            .with_fingerprint(Some(fingerprint))
+            .build()
+            .unwrap();
+        let mut out_rows: Vec<Vec<u8>> = Vec::new();
+        encoder.encode_rows(&batch, 32, &mut out_rows).unwrap();
+        assert_eq!(out_rows.len(), 1);
+        assert!(
+            out_rows[0].len() > 10,
+            "Row should contain prefix + encoded value"
+        );
+        assert_eq!(out_rows[0][0], 0xC3);
+        assert_eq!(out_rows[0][1], 0x01);
+    }
+
+    #[test]
+    fn encode_rows_empty_batch() {
+        let schema = ArrowSchema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let arr = Int32Array::from(Vec::<i32>::new());
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)]).unwrap();
+        let encoder = RecordEncoder {
+            columns: vec![FieldBinding {
+                arrow_index: 0,
+                nullability: None,
+                plan: FieldPlan::Scalar,
+            }],
+            prefix: None,
+        };
+        let mut out_rows: Vec<Vec<u8>> = Vec::new();
+        encoder.encode_rows(&batch, 16, &mut out_rows).unwrap();
+        assert!(out_rows.is_empty());
+    }
+
+    #[test]
+    fn encode_rows_matches_encode_output() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Float64, false),
+        ]);
+        let int_arr = Int64Array::from(vec![100i64, 200, 300]);
+        let float_arr = Float64Array::from(vec![1.5, 2.5, 3.5]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(int_arr), Arc::new(float_arr)],
+        )
+        .unwrap();
+
+        let encoder = RecordEncoder {
+            columns: vec![
+                FieldBinding {
+                    arrow_index: 0,
+                    nullability: None,
+                    plan: FieldPlan::Scalar,
+                },
+                FieldBinding {
+                    arrow_index: 1,
+                    nullability: None,
+                    plan: FieldPlan::Scalar,
+                },
+            ],
+            prefix: None,
+        };
+        let mut stream_buf = Vec::new();
+        encoder.encode(&mut stream_buf, &batch).unwrap();
+        let mut out_rows: Vec<Vec<u8>> = Vec::new();
+        encoder.encode_rows(&batch, 32, &mut out_rows).unwrap();
+        let concatenated: Vec<u8> = out_rows.into_iter().flatten().collect();
+        assert_bytes_eq(&concatenated, &stream_buf);
+    }
+
+    #[test]
+    fn encode_rows_appends_to_existing_vec() {
+        let schema = ArrowSchema::new(vec![Field::new("x", DataType::Int32, false)]);
+        let arr = Int32Array::from(vec![5, 6]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)]).unwrap();
+        let encoder = RecordEncoder {
+            columns: vec![FieldBinding {
+                arrow_index: 0,
+                nullability: None,
+                plan: FieldPlan::Scalar,
+            }],
+            prefix: None,
+        };
+        let mut out_rows: Vec<Vec<u8>> = vec![vec![0xAA, 0xBB]];
+        encoder.encode_rows(&batch, 16, &mut out_rows).unwrap();
+        assert_eq!(out_rows.len(), 3);
+        assert_eq!(out_rows[0], vec![0xAA, 0xBB]);
+        assert_bytes_eq(&out_rows[1], &avro_long_bytes(5));
+        assert_bytes_eq(&out_rows[2], &avro_long_bytes(6));
+    }
+
+    #[test]
+    fn encode_rows_nullable_column() {
+        let schema = ArrowSchema::new(vec![Field::new("x", DataType::Int32, true)]);
+        let arr = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)]).unwrap();
+        let encoder = RecordEncoder {
+            columns: vec![FieldBinding {
+                arrow_index: 0,
+                nullability: Some(Nullability::NullFirst),
+                plan: FieldPlan::Scalar,
+            }],
+            prefix: None,
+        };
+        let mut out_rows: Vec<Vec<u8>> = Vec::new();
+        encoder.encode_rows(&batch, 16, &mut out_rows).unwrap();
+        assert_eq!(out_rows.len(), 3);
+        let mut expected_row0 = Vec::new();
+        expected_row0.extend(avro_long_bytes(1)); // union branch for value
+        expected_row0.extend(avro_long_bytes(1)); // value
+        assert_bytes_eq(&out_rows[0], &expected_row0);
+        let expected_row1 = avro_long_bytes(0); // union branch for null
+        assert_bytes_eq(&out_rows[1], &expected_row1);
+        let mut expected_row2 = Vec::new();
+        expected_row2.extend(avro_long_bytes(1)); // union branch for value
+        expected_row2.extend(avro_long_bytes(3)); // value
+        assert_bytes_eq(&out_rows[2], &expected_row2);
     }
 }
