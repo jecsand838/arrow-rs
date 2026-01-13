@@ -1064,7 +1064,7 @@ mod tests {
             #[cfg(feature = "xz")]
             "avro/alltypes_plain.xz.avro",
         ]
-            .into_iter()
+        .into_iter()
     }
 
     fn make_schema() -> Schema {
@@ -1081,7 +1081,7 @@ mod tests {
             Arc::new(make_schema()),
             vec![Arc::new(ids) as ArrayRef, Arc::new(names) as ArrayRef],
         )
-            .expect("failed to build test RecordBatch")
+        .expect("failed to build test RecordBatch")
     }
 
     #[test]
@@ -1161,7 +1161,7 @@ mod tests {
                 Arc::new(op_col) as ArrayRef,
             ],
         )
-            .expect("failed to create test batch");
+        .expect("failed to create test batch");
         let mut sink = Vec::new();
         let mut writer = WriterBuilder::new(schema)
             .with_fingerprint_strategy(FingerprintStrategy::Id(1))
@@ -1243,7 +1243,7 @@ mod tests {
                 Arc::new(op_col) as ArrayRef,
             ],
         )
-            .expect("failed to create products batch");
+        .expect("failed to create products batch");
         let mut sink = Vec::new();
         let mut writer = WriterBuilder::new(schema)
             .with_fingerprint_strategy(FingerprintStrategy::Id(1))
@@ -1307,13 +1307,14 @@ mod tests {
         use arrow_array::UnionArray;
         use arrow_buffer::Buffer;
         use arrow_schema::UnionFields;
-        let union_fields = UnionFields::new(
+        let union_fields = UnionFields::try_new(
             vec![2, 5],
             vec![
                 Field::new("v_str", DataType::Utf8, true),
                 Field::new("v_int", DataType::Int32, true),
             ],
-        );
+        )
+        .unwrap();
         let strings = StringArray::from(vec!["hello", "world"]);
         let ints = Int32Array::from(vec![10, 20, 30]);
         let type_ids = Buffer::from_slice_ref([2_i8, 5, 5, 2, 5]);
@@ -2282,8 +2283,8 @@ mod tests {
             TimeUnit::Millisecond,
             TimeUnit::Second,
         ]
-            .into_iter()
-            .collect();
+        .into_iter()
+        .collect();
 
         let found_units: HashSet<TimeUnit> = in_schema
             .fields()
@@ -2414,7 +2415,7 @@ mod tests {
     #[cfg(feature = "avro_custom_types")]
     #[test]
     fn test_run_end_encoded_int64_run_ends_numeric_values_roundtrip_writer()
-        -> Result<(), ArrowError> {
+    -> Result<(), ArrowError> {
         let run_ends = Int64Array::from(vec![4_i64, 8_i64]);
         let run_values = Int32Array::from(vec![Some(999), Some(-5)]);
         let ree = RunArray::<Int64Type>::try_new(&run_ends, &run_values)?;
@@ -2606,7 +2607,7 @@ mod tests {
     #[cfg(not(feature = "avro_custom_types"))]
     #[test]
     fn test_run_end_encoded_string_values_int16_run_ends_roundtrip_writer_feature_off()
-        -> Result<(), ArrowError> {
+    -> Result<(), ArrowError> {
         use arrow_schema::{DataType, Field, Schema};
         let run_ends = arrow_array::Int16Array::from(vec![2, 5, 7]);
         let run_values = arrow_array::StringArray::from(vec![Some("a"), None, Some("c")]);
@@ -2650,7 +2651,7 @@ mod tests {
     #[cfg(not(feature = "avro_custom_types"))]
     #[test]
     fn test_run_end_encoded_int64_run_ends_numeric_values_roundtrip_writer_feature_off()
-        -> Result<(), ArrowError> {
+    -> Result<(), ArrowError> {
         use arrow_schema::{DataType, Field, Schema};
         let run_ends = arrow_array::Int64Array::from(vec![4_i64, 8_i64]);
         let run_values = Int32Array::from(vec![Some(999), Some(-5)]);
@@ -3048,7 +3049,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(a) as ArrayRef, Arc::new(b) as ArrayRef],
         )
-            .expect("failed to build test RecordBatch")
+        .expect("failed to build test RecordBatch")
     }
 
     fn make_real_avro_schema_and_batch() -> Result<(Schema, RecordBatch, AvroSchema), ArrowError> {
