@@ -510,7 +510,7 @@ impl Decoder {
                 )
             }
             (Codec::Uuid, _) => Self::Uuid(Vec::with_capacity(DEFAULT_CAPACITY)),
-            (Codec::Union(encodings, fields, UnionMode::Dense), _) => {
+            (Codec::Union(encodings, fields, mode), _) => {
                 let decoders = encodings
                     .iter()
                     .map(Self::try_new_internal)
@@ -535,18 +535,14 @@ impl Decoder {
                 }
                 let mut builder = UnionDecoderBuilder::new()
                     .with_fields(fields.clone())
-                    .with_branches(decoders);
+                    .with_branches(decoders)
+                    .with_mode(*mode);
                 if let Some(ResolutionInfo::Union(info)) = data_type.resolution.as_ref() {
                     if info.reader_is_union {
                         builder = builder.with_resolved_union(info.clone());
                     }
                 }
                 Self::Union(builder.build()?)
-            }
-            (Codec::Union(_, _, _), _) => {
-                return Err(AvroError::NYI(
-                    "Sparse Arrow unions are not yet supported".to_string(),
-                ));
             }
             #[cfg(feature = "avro_custom_types")]
             (Codec::RunEndEncoded(values_dt, width_bits_or_bytes), _) => {
@@ -1704,6 +1700,10 @@ struct UnionDecoder {
     default_emit_idx: usize,
     null_emit_idx: usize,
     plan: UnionReadPlan,
+    /// Union mode: Dense or Sparse
+    mode: UnionMode,
+    /// For sparse mode: null buffer builders for each branch to track validity
+    branch_nulls: Option<Vec<NullBufferBuilder>>,
 }
 
 impl Default for UnionDecoder {
@@ -1718,6 +1718,8 @@ impl Default for UnionDecoder {
             default_emit_idx: 0,
             null_emit_idx: 0,
             plan: UnionReadPlan::Passthrough,
+            mode: UnionMode::Dense,
+            branch_nulls: None,
         }
     }
 }
@@ -1743,6 +1745,7 @@ impl UnionDecoder {
         fields: UnionFields,
         branches: Vec<Decoder>,
         resolved: Option<ResolvedUnion>,
+        mode: UnionMode,
     ) -> Result<Self, AvroError> {
         let reader_type_codes = fields.iter().map(|(tid, _)| tid).collect::<Vec<i8>>();
         let null_branch = branches.iter().position(|b| matches!(b, Decoder::Null(_)));
@@ -1759,6 +1762,17 @@ impl UnionDecoder {
                 i32::MAX
             )));
         }
+
+        // For sparse mode, initialize null buffer builders for each branch
+        let branch_nulls = match mode {
+            UnionMode::Sparse => Some(
+                (0..branches.len())
+                    .map(|_| NullBufferBuilder::new(DEFAULT_CAPACITY))
+                    .collect(),
+            ),
+            UnionMode::Dense => None,
+        };
+
         Ok(Self {
             fields,
             type_ids: Vec::with_capacity(DEFAULT_CAPACITY),
@@ -1769,6 +1783,8 @@ impl UnionDecoder {
             default_emit_idx,
             null_emit_idx,
             plan: Self::plan_from_resolved(resolved)?,
+            mode,
+            branch_nulls,
         })
     }
 
@@ -1846,15 +1862,42 @@ impl UnionDecoder {
     #[inline]
     fn emit_to(&mut self, reader_idx: usize) -> Result<&mut Decoder, AvroError> {
         let branches_len = self.branches.len();
-        let Some(reader_branch) = self.branches.get_mut(reader_idx) else {
+        if reader_idx >= branches_len {
             return Err(AvroError::ParseError(format!(
                 "Union branch index {reader_idx} out of range ({branches_len} branches)"
             )));
-        };
+        }
         self.type_ids.push(self.reader_type_codes[reader_idx]);
-        self.offsets.push(self.counts[reader_idx]);
-        self.counts[reader_idx] += 1;
-        Ok(reader_branch)
+
+        match self.mode {
+            UnionMode::Dense => {
+                self.offsets.push(self.counts[reader_idx]);
+                self.counts[reader_idx] += 1;
+            }
+            UnionMode::Sparse => {
+                // For sparse mode, we need to:
+                // 1. Append null to all non-selected branches
+                // 2. Track validity in branch_nulls
+                if let Some(ref mut branch_nulls) = self.branch_nulls {
+                    for (i, (branch, null_builder)) in self
+                        .branches
+                        .iter_mut()
+                        .zip(branch_nulls.iter_mut())
+                        .enumerate()
+                    {
+                        if i == reader_idx {
+                            // Selected branch: mark as valid
+                            null_builder.append_non_null();
+                        } else {
+                            // Non-selected branch: append null and mark as null
+                            branch.append_null()?;
+                            null_builder.append_null();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(self.branches.get_mut(reader_idx).unwrap())
     }
 
     #[inline]
@@ -1921,15 +1964,42 @@ impl UnionDecoder {
             "UnionArray does not accept a validity bitmap; \
                      nulls should have been materialized as a Null child during decode"
         );
-        let children = self
-            .branches
-            .iter_mut()
-            .map(|d| d.flush(None))
-            .collect::<Result<Vec<_>, _>>()?;
+
+        let (offsets, children) = match self.mode {
+            UnionMode::Dense => {
+                // Dense: flush children with no null buffer, use offsets
+                let children = self
+                    .branches
+                    .iter_mut()
+                    .map(|d| d.flush(None))
+                    .collect::<Result<Vec<_>, _>>()?;
+                (
+                    Some(flush_values(&mut self.offsets).into_iter().collect()),
+                    children,
+                )
+            }
+            UnionMode::Sparse => {
+                // Sparse: flush children with their null buffers, no offsets
+                let children = if let Some(ref mut branch_nulls) = self.branch_nulls {
+                    self.branches
+                        .iter_mut()
+                        .zip(branch_nulls.iter_mut())
+                        .map(|(d, null_builder)| d.flush(null_builder.finish()))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    self.branches
+                        .iter_mut()
+                        .map(|d| d.flush(None))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                (None, children)
+            }
+        };
+
         let arr = UnionArray::try_new(
             self.fields.clone(),
             flush_values(&mut self.type_ids).into_iter().collect(),
-            Some(flush_values(&mut self.offsets).into_iter().collect()),
+            offsets,
             children,
         )
         .map_err(|e| AvroError::ParseError(e.to_string()))?;
@@ -1937,12 +2007,25 @@ impl UnionDecoder {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct UnionDecoderBuilder {
     fields: Option<UnionFields>,
     branches: Option<Vec<Decoder>>,
     resolved: Option<ResolvedUnion>,
     target: Option<Box<Decoder>>,
+    mode: UnionMode,
+}
+
+impl Default for UnionDecoderBuilder {
+    fn default() -> Self {
+        Self {
+            fields: None,
+            branches: None,
+            resolved: None,
+            target: None,
+            mode: UnionMode::Dense,
+        }
+    }
 }
 
 impl UnionDecoderBuilder {
@@ -1970,10 +2053,15 @@ impl UnionDecoderBuilder {
         self
     }
 
+    fn with_mode(mut self, mode: UnionMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
     fn build(self) -> Result<UnionDecoder, AvroError> {
         match (self.resolved, self.fields, self.branches, self.target) {
             (resolved, Some(fields), Some(branches), None) => {
-                UnionDecoder::try_new(fields, branches, resolved)
+                UnionDecoder::try_new(fields, branches, resolved, self.mode)
             }
             (Some(info), None, None, Some(target))
                 if info.writer_is_union && !info.reader_is_union =>
@@ -4265,28 +4353,170 @@ mod tests {
         );
     }
 
+    // ================== Sparse Union Decoder Tests ==================
+
+    /// Helper to create a sparse union AvroDataType
+    fn make_sparse_union_avro(
+        children: Vec<(Codec, &'_ str, DataType)>,
+        type_ids: Vec<i8>,
+    ) -> AvroDataType {
+        let mut avro_children: Vec<AvroDataType> = Vec::with_capacity(children.len());
+        let mut fields: Vec<arrow_schema::Field> = Vec::with_capacity(children.len());
+        for (codec, name, dt) in children.into_iter() {
+            avro_children.push(AvroDataType::new(codec, Default::default(), None));
+            fields.push(arrow_schema::Field::new(name, dt, true));
+        }
+        let union_fields = UnionFields::try_new(type_ids, fields).unwrap();
+        let union_codec = Codec::Union(avro_children.into(), union_fields, UnionMode::Sparse);
+        AvroDataType::new(union_codec, Default::default(), None)
+    }
+
+    /// Test that sparse union decoder produces correct output.
+    /// - No offsets in the output array
+    /// - All child arrays have length equal to union length
+    /// - Unselected child positions are null
     #[test]
-    fn test_union_sparse_mode_not_supported() {
-        let children: Vec<AvroDataType> = vec![
-            AvroDataType::new(Codec::Int32, Default::default(), None),
-            AvroDataType::new(Codec::Utf8, Default::default(), None),
-        ];
-        let uf = UnionFields::try_new(
-            vec![1, 3],
+    fn test_union_decoder_sparse_mode_pads_children() {
+        let union_dt = make_sparse_union_avro(
             vec![
-                arrow_schema::Field::new("i", DataType::Int32, true),
-                arrow_schema::Field::new("s", DataType::Utf8, true),
+                (Codec::Int32, "i", DataType::Int32),
+                (Codec::Utf8, "s", DataType::Utf8),
             ],
-        )
-        .unwrap();
-        let codec = Codec::Union(children.into(), uf, UnionMode::Sparse);
-        let dt = AvroDataType::new(codec, Default::default(), None);
-        let err = Decoder::try_new(&dt).expect_err("sparse union should not be supported");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Sparse Arrow unions are not yet supported"),
-            "unexpected error message: {msg}"
+            vec![2, 5], // Custom type IDs
         );
+
+        let mut dec = Decoder::try_new(&union_dt).unwrap();
+
+        // Encode 3 rows:
+        // Row 0: branch 0 (int), value 7
+        // Row 1: branch 1 (string), value "x"
+        // Row 2: branch 0 (int), value -1
+        let mut r1 = Vec::new();
+        r1.extend_from_slice(&encode_avro_long(0)); // branch index
+        r1.extend_from_slice(&encode_avro_int(7));
+
+        let mut r2 = Vec::new();
+        r2.extend_from_slice(&encode_avro_long(1)); // branch index
+        r2.extend_from_slice(&encode_avro_bytes(b"x"));
+
+        let mut r3 = Vec::new();
+        r3.extend_from_slice(&encode_avro_long(0)); // branch index
+        r3.extend_from_slice(&encode_avro_int(-1));
+
+        dec.decode(&mut AvroCursor::new(&r1)).unwrap();
+        dec.decode(&mut AvroCursor::new(&r2)).unwrap();
+        dec.decode(&mut AvroCursor::new(&r3)).unwrap();
+
+        let array = dec.flush(None).unwrap();
+        let ua = array
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("expected UnionArray");
+
+        // Check basic properties
+        assert_eq!(ua.len(), 3);
+
+        // Type IDs should be [2, 5, 2] (using custom type IDs)
+        assert_eq!(ua.type_id(0), 2);
+        assert_eq!(ua.type_id(1), 5);
+        assert_eq!(ua.type_id(2), 2);
+
+        // For sparse union: no offsets, so value_offset returns row index
+        // This is how Arrow's UnionArray works for sparse unions
+        assert_eq!(ua.value_offset(0), 0);
+        assert_eq!(ua.value_offset(1), 1);
+        assert_eq!(ua.value_offset(2), 2);
+
+        // Check child arrays have equal length (sparse requirement)
+        let int_child = ua.child(2);
+        let str_child = ua.child(5);
+
+        assert_eq!(
+            int_child.len(),
+            3,
+            "Int child should have length 3 (same as union)"
+        );
+        assert_eq!(
+            str_child.len(),
+            3,
+            "String child should have length 3 (same as union)"
+        );
+
+        // Check int values: row 0 has 7, row 1 is null, row 2 has -1
+        let int_arr = int_child
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int child");
+        assert!(!int_arr.is_null(0));
+        assert_eq!(int_arr.value(0), 7);
+        assert!(int_arr.is_null(1)); // Not selected at row 1
+        assert!(!int_arr.is_null(2));
+        assert_eq!(int_arr.value(2), -1);
+
+        // Check string values: row 0 is null, row 1 has "x", row 2 is null
+        let str_arr = str_child
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string child");
+        assert!(str_arr.is_null(0)); // Not selected at row 0
+        assert!(!str_arr.is_null(1));
+        assert_eq!(str_arr.value(1), "x");
+        assert!(str_arr.is_null(2)); // Not selected at row 2
+    }
+
+    /// Test sparse union decoder with null branch included.
+    #[test]
+    fn test_union_decoder_sparse_with_null_branch() {
+        let union_dt = make_sparse_union_avro(
+            vec![
+                (Codec::Null, "n", DataType::Null),
+                (Codec::Int32, "i", DataType::Int32),
+            ],
+            vec![10, 20],
+        );
+
+        let mut dec = Decoder::try_new(&union_dt).unwrap();
+
+        // Row 0: null branch
+        // Row 1: int branch, value 42
+        // Row 2: null branch
+        let r1 = encode_avro_long(0); // null branch (no payload)
+        let mut r2 = Vec::new();
+        r2.extend_from_slice(&encode_avro_long(1));
+        r2.extend_from_slice(&encode_avro_int(42));
+        let r3 = encode_avro_long(0); // null branch
+
+        dec.decode(&mut AvroCursor::new(&r1)).unwrap();
+        dec.decode(&mut AvroCursor::new(&r2)).unwrap();
+        dec.decode(&mut AvroCursor::new(&r3)).unwrap();
+
+        let array = dec.flush(None).unwrap();
+        let ua = array
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("expected UnionArray");
+
+        assert_eq!(ua.len(), 3);
+        assert_eq!(ua.type_id(0), 10);
+        assert_eq!(ua.type_id(1), 20);
+        assert_eq!(ua.type_id(2), 10);
+
+        // Check children have length 3
+        let null_child = ua.child(10);
+        let int_child = ua.child(20);
+
+        assert_eq!(null_child.len(), 3);
+        assert_eq!(int_child.len(), 3);
+
+        // Int child: row 1 has 42, rows 0 and 2 are null
+        let int_arr = int_child
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int child");
+        assert!(int_arr.is_null(0));
+        assert!(!int_arr.is_null(1));
+        assert_eq!(int_arr.value(1), 42);
+        assert!(int_arr.is_null(2));
     }
 
     fn make_record_decoder_with_projector_defaults(

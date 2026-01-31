@@ -41,7 +41,7 @@ use arrow_array::{
 #[cfg(feature = "small_decimals")]
 use arrow_array::{Decimal32Array, Decimal64Array};
 use arrow_buffer::{ArrowNativeType, NullBuffer};
-use arrow_schema::{DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit, UnionMode};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit};
 use bytes::{BufMut, BytesMut};
 use std::io::Write;
 use std::sync::Arc;
@@ -1170,13 +1170,16 @@ impl FieldPlan {
                     "Avro 'duration' logical type requires an Arrow Interval (MonthDayNano, YearMonth, or DayTime), found: {other:?}"
                 ))),
             },
-            Codec::Union(avro_branches, _, UnionMode::Dense) => {
+            Codec::Union(avro_branches, _, avro_mode) => {
                 let arrow_union_fields = match arrow_field.data_type() {
-                    DataType::Union(fields, UnionMode::Dense) => fields,
-                    DataType::Union(_, UnionMode::Sparse) => {
-                        return Err(AvroError::NYI(
-                            "Sparse Arrow unions are not yet supported".to_string(),
-                        ));
+                    DataType::Union(fields, arrow_mode) => {
+                        if avro_mode != arrow_mode {
+                            return Err(AvroError::SchemaError(format!(
+                                "Union mode mismatch: Avro expects {:?} but Arrow has {:?}",
+                                avro_mode, arrow_mode
+                            )));
+                        }
+                        fields
                     }
                     other => {
                         return Err(AvroError::SchemaError(format!(
@@ -1206,9 +1209,6 @@ impl FieldPlan {
                     .collect::<Result<Vec<_>, AvroError>>()?;
                 Ok(FieldPlan::Union { bindings })
             }
-            Codec::Union(_, _, UnionMode::Sparse) => Err(AvroError::NYI(
-                "Sparse Arrow unions are not yet supported".to_string(),
-            )),
             #[cfg(feature = "avro_custom_types")]
             Codec::RunEndEncoded(values_dt, _width_code) => {
                 let values_field = match arrow_field.data_type() {
@@ -1884,8 +1884,8 @@ struct UnionEncoder<'a> {
 
 impl<'a> UnionEncoder<'a> {
     fn try_new(array: &'a UnionArray, field_bindings: &[FieldBinding]) -> Result<Self, AvroError> {
-        let DataType::Union(fields, UnionMode::Dense) = array.data_type() else {
-            return Err(AvroError::SchemaError("Expected Dense UnionArray".into()));
+        let DataType::Union(fields, _mode) = array.data_type() else {
+            return Err(AvroError::SchemaError("Expected UnionArray".into()));
         };
         if fields.len() != field_bindings.len() {
             return Err(AvroError::SchemaError(format!(
@@ -3832,5 +3832,139 @@ mod tests {
         let err = encoder.encode(&mut writer, &batch).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("write prefix"), "unexpected error: {msg}");
+    }
+
+    // ================== Sparse Union Encoder Tests ==================
+
+    /// Test that sparse unions can be planned and encoded.
+    /// This creates a sparse union array and verifies the encoder accepts it.
+    #[test]
+    fn union_encoder_string_int_sparse() {
+        // Create child arrays - for sparse unions, each child has length == union length
+        // Unselected positions should be null
+        let strings = StringArray::from(vec![Some("hello"), None, None, Some("world"), None]);
+        let ints = Int32Array::from(vec![None, Some(10), Some(20), None, Some(30)]);
+
+        let union_fields = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Field::new("v_str", DataType::Utf8, true),
+                Field::new("v_int", DataType::Int32, true),
+            ],
+        )
+        .unwrap();
+
+        // Type IDs indicating which branch is selected at each row
+        // Row 0: string, Row 1: int, Row 2: int, Row 3: string, Row 4: int
+        let type_ids = Buffer::from_slice_ref([0_i8, 1, 1, 0, 1]);
+
+        // Sparse union: no offsets buffer, pass None
+        let union_array = UnionArray::try_new(
+            union_fields,
+            type_ids.into(),
+            None, // Sparse - no offsets
+            vec![Arc::new(strings), Arc::new(ints)],
+        )
+        .unwrap();
+
+        let plan = FieldPlan::Union {
+            bindings: vec![
+                FieldBinding {
+                    arrow_index: 0,
+                    nullability: None,
+                    plan: FieldPlan::Scalar,
+                },
+                FieldBinding {
+                    arrow_index: 1,
+                    nullability: None,
+                    plan: FieldPlan::Scalar,
+                },
+            ],
+        };
+
+        // This should succeed (currently fails with NYI error)
+        let got = encode_all(&union_array, &plan, None);
+
+        // Expected encoding is the same as dense - Avro doesn't distinguish:
+        // Row 0: branch 0, string "hello"
+        // Row 1: branch 1, int 10
+        // Row 2: branch 1, int 20
+        // Row 3: branch 0, string "world"
+        // Row 4: branch 1, int 30
+        let mut expected = Vec::new();
+        expected.extend(avro_long_bytes(0));
+        expected.extend(avro_len_prefixed_bytes(b"hello"));
+        expected.extend(avro_long_bytes(1));
+        expected.extend(avro_long_bytes(10));
+        expected.extend(avro_long_bytes(1));
+        expected.extend(avro_long_bytes(20));
+        expected.extend(avro_long_bytes(0));
+        expected.extend(avro_len_prefixed_bytes(b"world"));
+        expected.extend(avro_long_bytes(1));
+        expected.extend(avro_long_bytes(30));
+
+        assert_bytes_eq(&got, &expected);
+    }
+
+    /// Test that sparse union with non-zero type IDs encodes correctly.
+    #[test]
+    fn union_encoder_string_int_nonzero_type_ids_sparse() {
+        // Create child arrays for sparse union
+        let strings = StringArray::from(vec![Some("hello"), None, None, Some("world"), None]);
+        let ints = Int32Array::from(vec![None, Some(10), Some(20), None, Some(30)]);
+
+        // Non-zero type IDs
+        let union_fields = UnionFields::try_new(
+            vec![2, 5],
+            vec![
+                Field::new("v_str", DataType::Utf8, true),
+                Field::new("v_int", DataType::Int32, true),
+            ],
+        )
+        .unwrap();
+
+        // Type IDs: 2=string, 5=int
+        let type_ids = Buffer::from_slice_ref([2_i8, 5, 5, 2, 5]);
+
+        // Sparse union: no offsets
+        let union_array = UnionArray::try_new(
+            union_fields,
+            type_ids.into(),
+            None, // Sparse
+            vec![Arc::new(strings), Arc::new(ints)],
+        )
+        .unwrap();
+
+        let plan = FieldPlan::Union {
+            bindings: vec![
+                FieldBinding {
+                    arrow_index: 0,
+                    nullability: None,
+                    plan: FieldPlan::Scalar,
+                },
+                FieldBinding {
+                    arrow_index: 1,
+                    nullability: None,
+                    plan: FieldPlan::Scalar,
+                },
+            ],
+        };
+
+        let got = encode_all(&union_array, &plan, None);
+
+        // Avro branch indices are still 0, 1 (encoder index), not the Arrow type IDs
+        let mut expected = Vec::new();
+        expected.extend(avro_long_bytes(0)); // encoder index 0 for type_id 2
+        expected.extend(avro_len_prefixed_bytes(b"hello"));
+        expected.extend(avro_long_bytes(1)); // encoder index 1 for type_id 5
+        expected.extend(avro_long_bytes(10));
+        expected.extend(avro_long_bytes(1));
+        expected.extend(avro_long_bytes(20));
+        expected.extend(avro_long_bytes(0));
+        expected.extend(avro_len_prefixed_bytes(b"world"));
+        expected.extend(avro_long_bytes(1));
+        expected.extend(avro_long_bytes(30));
+
+        assert_bytes_eq(&got, &expected);
     }
 }

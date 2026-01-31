@@ -4887,4 +4887,135 @@ mod tests {
         }
         Ok(())
     }
+
+    // ================== Sparse Union Round-Trip Test ==================
+
+    /// End-to-end test for sparse union support:
+    /// - Creates an Arrow schema with a sparse union column using custom type IDs
+    /// - Writes to OCF format
+    /// - Reads back and verifies data and schema round-trip correctly
+    #[test]
+    fn test_sparse_union_roundtrip() -> Result<(), AvroError> {
+        use arrow_array::UnionArray;
+        use arrow_buffer::Buffer;
+        use arrow_schema::{UnionFields, UnionMode};
+
+        // Create a sparse union with custom type IDs [10, 20]
+        let union_fields = UnionFields::try_new(
+            vec![10, 20],
+            vec![
+                Field::new("int_branch", DataType::Int32, true),
+                Field::new("str_branch", DataType::Utf8, true),
+            ],
+        )
+        .unwrap();
+
+        // Build child arrays for sparse union:
+        // - Each child has length == union length
+        // - Non-selected positions are null
+        // Row 0: int=42, str=null  (type_id=10, select int)
+        // Row 1: int=null, str="hello" (type_id=20, select str)
+        // Row 2: int=-1, str=null  (type_id=10, select int)
+        // Row 3: int=null, str="world" (type_id=20, select str)
+        let int_child = Int32Array::from(vec![Some(42), None, Some(-1), None]);
+        let str_child = StringArray::from(vec![None, Some("hello"), None, Some("world")]);
+
+        let type_ids = Buffer::from_slice_ref([10_i8, 20, 10, 20]);
+
+        // Create sparse union (offsets = None)
+        let union_array = UnionArray::try_new(
+            union_fields.clone(),
+            type_ids.into(),
+            None, // Sparse union - no offsets
+            vec![Arc::new(int_child) as ArrayRef, Arc::new(str_child)],
+        )
+        .unwrap();
+
+        // Create schema with the sparse union
+        let schema = Schema::new(vec![Field::new(
+            "union_col",
+            DataType::Union(union_fields.clone(), UnionMode::Sparse),
+            false,
+        )]);
+
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(union_array)]).unwrap();
+
+        // Write to OCF format
+        let mut buffer = Vec::<u8>::new();
+        let mut writer = AvroWriter::new(&mut buffer, schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        drop(writer);
+
+        // Read back
+        let reader = ReaderBuilder::new()
+            .build(Cursor::new(buffer))
+            .expect("build reader for sparse union roundtrip");
+        let roundtrip_schema = reader.schema();
+        let roundtrip_batches = reader.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(roundtrip_batches.len(), 1);
+        let roundtrip = &roundtrip_batches[0];
+
+        // Verify the union column exists
+        assert_eq!(roundtrip.num_columns(), 1);
+        let roundtrip_union = roundtrip
+            .column(0)
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("Expected UnionArray");
+
+        // Verify data length
+        assert_eq!(roundtrip_union.len(), 4);
+
+        // Verify the schema field is a union with the expected structure
+        let field = roundtrip_schema.field(0);
+        if let DataType::Union(uf, mode) = field.data_type() {
+            // Verify mode is preserved as Sparse
+            assert_eq!(
+                *mode,
+                UnionMode::Sparse,
+                "Expected UnionMode::Sparse after roundtrip"
+            );
+
+            // Verify type IDs are preserved
+            let roundtrip_tids: Vec<i8> = uf.iter().map(|(tid, _)| tid).collect();
+            assert_eq!(
+                roundtrip_tids,
+                vec![10, 20],
+                "Expected type IDs [10, 20] after roundtrip"
+            );
+
+            // Check type IDs in the data - should be the custom IDs
+            assert_eq!(roundtrip_union.type_id(0), 10, "Row 0 type_id");
+            assert_eq!(roundtrip_union.type_id(1), 20, "Row 1 type_id");
+            assert_eq!(roundtrip_union.type_id(2), 10, "Row 2 type_id");
+            assert_eq!(roundtrip_union.type_id(3), 20, "Row 3 type_id");
+
+            // Verify the values at each row
+            // Row 0: int branch, value 42
+            let v0 = roundtrip_union.value(0);
+            let int_val_0 = v0.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(int_val_0.value(0), 42);
+
+            // Row 1: str branch, value "hello"
+            let v1 = roundtrip_union.value(1);
+            let str_val_1 = v1.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(str_val_1.value(0), "hello");
+
+            // Row 2: int branch, value -1
+            let v2 = roundtrip_union.value(2);
+            let int_val_2 = v2.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(int_val_2.value(0), -1);
+
+            // Row 3: str branch, value "world"
+            let v3 = roundtrip_union.value(3);
+            let str_val_3 = v3.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(str_val_3.value(0), "world");
+        } else {
+            panic!("Expected Union type, got {:?}", field.data_type());
+        }
+
+        Ok(())
+    }
 }

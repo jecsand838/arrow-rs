@@ -135,11 +135,20 @@ pub(crate) struct Attributes<'a> {
     pub(crate) additional: HashMap<&'a str, Value>,
 }
 
+/// Internal metadata keys used for union reconstruction that should not be
+/// propagated to Arrow field metadata
+const INTERNAL_UNION_KEYS: &[&str] = &["arrowUnionMode", "arrowUnionTypeIds"];
+
 impl Attributes<'_> {
     /// Returns the field metadata for this [`Attributes`]
+    ///
+    /// Note: Internal union metadata keys (arrowUnionMode, arrowUnionTypeIds) are
+    /// excluded since they are consumed during schema parsing and should not be
+    /// propagated to Arrow field metadata.
     pub(crate) fn field_metadata(&self) -> HashMap<String, String> {
         self.additional
             .iter()
+            .filter(|(k, _)| !INTERNAL_UNION_KEYS.contains(k))
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
     }
@@ -1858,22 +1867,22 @@ fn datatype_to_avro(
                     ));
                 }
             }
-            if !strip {
-                extras.insert(
-                    "arrowUnionMode".into(),
-                    Value::String(
-                        match mode {
-                            UnionMode::Sparse => "sparse",
-                            UnionMode::Dense => "dense",
-                        }
-                        .to_string(),
-                    ),
-                );
-                extras.insert(
-                    "arrowUnionTypeIds".into(),
-                    Value::Array(type_ids.into_iter().map(|id| json!(id)).collect()),
-                );
-            }
+            // Union mode and type IDs are always included regardless of strip_metadata
+            // because they're essential for correct Arrow union reconstruction
+            extras.insert(
+                "arrowUnionMode".into(),
+                Value::String(
+                    match mode {
+                        UnionMode::Sparse => "sparse",
+                        UnionMode::Dense => "dense",
+                    }
+                    .to_string(),
+                ),
+            );
+            extras.insert(
+                "arrowUnionTypeIds".into(),
+                Value::Array(type_ids.into_iter().map(|id| json!(id)).collect()),
+            );
             Value::Array(branches)
         }
         #[cfg(not(feature = "small_decimals"))]
@@ -3419,6 +3428,8 @@ mod tests {
             .map(|n| n.as_i64().expect("i64"))
             .collect();
         assert_eq!(type_ids, vec![2, 7]);
+        // Even with strip_metadata=true, union metadata (arrowUnionMode, arrowUnionTypeIds)
+        // is always preserved because it's essential for correct Arrow union reconstruction
         let stripped = AvroSchema::from_arrow_with_options(
             &arrow_schema,
             Some(AvroSchemaOptions {
@@ -3431,15 +3442,21 @@ mod tests {
         let union_arr2 = v_stripped["fields"][0]["type"]
             .as_array()
             .expect("union array");
-        assert!(
-            !union_arr2.iter().any(|b| b
-                .as_object()
-                .is_some_and(|m| m.contains_key("arrowUnionMode"))),
-            "extras must be removed when strip_metadata=true"
+        // Union metadata should still be present even with strip_metadata=true
+        let first_obj2 = union_arr2
+            .iter()
+            .find(|b| b.is_object())
+            .expect("expected an object branch with union metadata");
+        let obj2 = first_obj2.as_object().unwrap();
+        assert_eq!(
+            obj2.get("arrowUnionMode").and_then(|m| m.as_str()),
+            Some("dense"),
+            "arrowUnionMode must be preserved even when strip_metadata=true"
         );
-        assert_eq!(union_arr2[0], Value::String("null".into()));
-        assert_eq!(union_arr2[1], Value::String("int".into()));
-        assert_eq!(union_arr2[2], Value::String("string".into()));
+        assert!(
+            obj2.contains_key("arrowUnionTypeIds"),
+            "arrowUnionTypeIds must be preserved even when strip_metadata=true"
+        );
     }
 
     #[test]

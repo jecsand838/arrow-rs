@@ -1130,13 +1130,110 @@ fn union_branch_name(dt: &AvroDataType) -> String {
     dt.codec.union_field_name()
 }
 
-fn build_union_fields(encodings: &[AvroDataType]) -> Result<UnionFields, ArrowError> {
+/// Metadata keys for union layout hints
+const ARROW_UNION_MODE_KEY: &str = "arrowUnionMode";
+const ARROW_UNION_TYPE_IDS_KEY: &str = "arrowUnionTypeIds";
+
+/// Extracts union layout metadata (mode and type IDs) from union variants.
+///
+/// Scans all variants looking for `arrowUnionMode` and `arrowUnionTypeIds` in their
+/// attributes. Returns the mode (default Dense) and optional explicit type IDs.
+fn extract_union_layout(
+    variants: &[Schema<'_>],
+) -> Result<(UnionMode, Option<Vec<i8>>), ArrowError> {
+    let mut mode = UnionMode::Dense;
+    let mut type_ids_opt: Option<Vec<i8>> = None;
+
+    // Scan variants for metadata - could be on any branch, typically on first non-null
+    for variant in variants {
+        let attrs = match variant {
+            Schema::Type(t) => Some(&t.attributes),
+            Schema::Complex(ComplexType::Record(r)) => Some(&r.attributes),
+            Schema::Complex(ComplexType::Enum(e)) => Some(&e.attributes),
+            Schema::Complex(ComplexType::Array(a)) => Some(&a.attributes),
+            Schema::Complex(ComplexType::Map(m)) => Some(&m.attributes),
+            Schema::Complex(ComplexType::Fixed(f)) => Some(&f.attributes),
+            _ => None,
+        };
+
+        if let Some(attrs) = attrs {
+            // Check for union mode
+            if let Some(Value::String(s)) = attrs.additional.get(ARROW_UNION_MODE_KEY) {
+                mode = match s.to_lowercase().as_str() {
+                    "dense" => UnionMode::Dense,
+                    "sparse" => UnionMode::Sparse,
+                    other => {
+                        return Err(ArrowError::ParseError(format!(
+                            "Invalid {ARROW_UNION_MODE_KEY} value: '{other}'. Expected 'Dense' or 'Sparse'"
+                        )));
+                    }
+                };
+            }
+
+            // Check for explicit type IDs
+            if let Some(Value::Array(arr)) = attrs.additional.get(ARROW_UNION_TYPE_IDS_KEY) {
+                let mut ids = Vec::with_capacity(arr.len());
+                for v in arr {
+                    let id = match v {
+                        Value::Number(n) => n.as_i64().ok_or_else(|| {
+                            ArrowError::ParseError(format!(
+                                "Invalid {ARROW_UNION_TYPE_IDS_KEY} value: {v}"
+                            ))
+                        })?,
+                        _ => {
+                            return Err(ArrowError::ParseError(format!(
+                                "Invalid {ARROW_UNION_TYPE_IDS_KEY} element: expected number, got {v}"
+                            )));
+                        }
+                    };
+                    if id < i8::MIN as i64 || id > i8::MAX as i64 {
+                        return Err(ArrowError::ParseError(format!(
+                            "Type ID {id} is out of i8 range"
+                        )));
+                    }
+                    ids.push(id as i8);
+                }
+                type_ids_opt = Some(ids);
+            }
+        }
+    }
+
+    // Validate type IDs length if provided
+    if let Some(ref ids) = type_ids_opt {
+        if ids.len() != variants.len() {
+            return Err(ArrowError::ParseError(format!(
+                "{ARROW_UNION_TYPE_IDS_KEY} has {} elements but union has {} variants",
+                ids.len(),
+                variants.len()
+            )));
+        }
+        // Check for duplicates
+        let mut seen = HashSet::new();
+        for id in ids {
+            if !seen.insert(*id) {
+                return Err(ArrowError::ParseError(format!(
+                    "Duplicate type ID {id} in {ARROW_UNION_TYPE_IDS_KEY}"
+                )));
+            }
+        }
+    }
+
+    Ok((mode, type_ids_opt))
+}
+
+fn build_union_fields(
+    encodings: &[AvroDataType],
+    type_ids: Option<&[i8]>,
+) -> Result<UnionFields, ArrowError> {
     let arrow_fields: Vec<Field> = encodings
         .iter()
         .map(|encoding| encoding.field_with_name(&union_branch_name(encoding)))
         .collect();
-    let type_ids: Vec<i8> = (0..arrow_fields.len()).map(|i| i as i8).collect();
-    UnionFields::try_new(type_ids, arrow_fields)
+    let ids: Vec<i8> = match type_ids {
+        Some(ids) => ids.to_vec(),
+        None => (0..arrow_fields.len()).map(|i| i as i8).collect(),
+    };
+    UnionFields::try_new(ids, arrow_fields)
 }
 
 /// Resolves Avro type names to [`AvroDataType`]
@@ -1398,15 +1495,17 @@ impl<'a> Maker<'a> {
                         "Avro union contains duplicate branch type: {dup}"
                     )));
                 }
+                // Extract union layout metadata (mode and optional type IDs)
+                let (mode, type_ids_opt) = extract_union_layout(f)?;
                 // Parse all branches
                 let children: Vec<AvroDataType> = f
                     .iter()
                     .map(|s| self.parse_type(s, namespace))
                     .collect::<Result<_, _>>()?;
                 // Build Arrow layout once here
-                let union_fields = build_union_fields(&children)?;
+                let union_fields = build_union_fields(&children, type_ids_opt.as_deref())?;
                 Ok(AvroDataType::new(
-                    Codec::Union(Arc::from(children), union_fields, UnionMode::Dense),
+                    Codec::Union(Arc::from(children), union_fields, mode),
                     Default::default(),
                     None,
                 ))
@@ -1691,6 +1790,11 @@ impl<'a> Maker<'a> {
                 }
                 if !t.attributes.additional.is_empty() {
                     for (k, v) in &t.attributes.additional {
+                        // Skip internal union metadata keys as these are consumed during
+                        // schema parsing and should not propagate to Arrow field metadata
+                        if k == &ARROW_UNION_MODE_KEY || k == &ARROW_UNION_TYPE_IDS_KEY {
+                            continue;
+                        }
                         field.metadata.insert(k.to_string(), v.to_string());
                     }
                 }
@@ -1765,6 +1869,9 @@ impl<'a> Maker<'a> {
                     }));
                     Ok(dt)
                 } else {
+                    // Extract layout from reader schema (reader schema wins)
+                    let (mode, type_ids_opt) = extract_union_layout(reader_variants)?;
+
                     let mut best_match: Option<(usize, AvroDataType, Promotion)> = None;
                     for (i, variant) in reader_variants.iter().enumerate() {
                         if let Ok(resolved_dt) =
@@ -1798,9 +1905,9 @@ impl<'a> Maker<'a> {
                             children.push(self.parse_type(variant, namespace)?);
                         }
                     }
-                    let union_fields = build_union_fields(&children)?;
+                    let union_fields = build_union_fields(&children, type_ids_opt.as_deref())?;
                     let mut dt = AvroDataType::new(
-                        Codec::Union(children.into(), union_fields, UnionMode::Dense),
+                        Codec::Union(children.into(), union_fields, mode),
                         Default::default(),
                         None,
                     );
@@ -1876,6 +1983,9 @@ impl<'a> Maker<'a> {
         reader_variants: &'s [Schema<'a>],
         namespace: Option<&'a str>,
     ) -> Result<AvroDataType, ArrowError> {
+        // Extract layout from reader schema (reader schema wins)
+        let (mode, type_ids_opt) = extract_union_layout(reader_variants)?;
+
         let reader_encodings: Vec<AvroDataType> = reader_variants
             .iter()
             .map(|reader_schema| self.parse_type(reader_schema, namespace))
@@ -1885,9 +1995,9 @@ impl<'a> Maker<'a> {
         for writer in writer_variants {
             writer_to_reader.push(self.find_best_promotion(writer, reader_variants, namespace));
         }
-        let union_fields = build_union_fields(&reader_encodings)?;
+        let union_fields = build_union_fields(&reader_encodings, type_ids_opt.as_deref())?;
         let mut dt = AvroDataType::new(
-            Codec::Union(reader_encodings.into(), union_fields, UnionMode::Dense),
+            Codec::Union(reader_encodings.into(), union_fields, mode),
             Default::default(),
             None,
         );
@@ -3478,5 +3588,209 @@ mod tests {
         maker
             .make_data_type(&writer_schema, Some(&reader_schema), None)
             .expect("fixed alias resolution should succeed");
+    }
+
+    // ================== Sparse Union Metadata Tests ==================
+
+    /// Test that parser honors arrowUnionMode and arrowUnionTypeIds metadata
+    /// on a real union (not a nullable union).
+    ///
+    /// This test creates a 3-variant union [null, int, string] with metadata
+    /// on the int branch specifying Sparse mode and custom type IDs [42, 7, 9].
+    #[test]
+    fn test_parse_union_metadata_sparse_mode_and_type_ids() {
+        use serde_json::json;
+
+        // Build a union with 3 variants: null, int (with metadata), string
+        // Put metadata on the int branch (first non-null branch object)
+        let mut int_attrs = Attributes::default();
+        int_attrs
+            .additional
+            .insert("arrowUnionMode", json!("Sparse"));
+        int_attrs
+            .additional
+            .insert("arrowUnionTypeIds", json!([42, 7, 9]));
+
+        let union_variants = vec![
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
+            Schema::Type(Type {
+                r#type: TypeName::Primitive(PrimitiveType::Int),
+                attributes: int_attrs,
+            }),
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
+        ];
+
+        let schema = Schema::Union(union_variants);
+
+        let mut maker = Maker::new(false, false);
+        let result = maker.make_data_type(&schema, None, None).unwrap();
+
+        // Should be a Union codec
+        if let Codec::Union(children, union_fields, mode) = result.codec() {
+            // Mode should be Sparse
+            assert_eq!(
+                *mode,
+                UnionMode::Sparse,
+                "Expected UnionMode::Sparse but got Dense"
+            );
+
+            // Type IDs should be [42, 7, 9]
+            let type_ids: Vec<i8> = union_fields.iter().map(|(tid, _)| tid).collect();
+            assert_eq!(type_ids, vec![42, 7, 9], "Type IDs should match metadata");
+
+            // Should have 3 children
+            assert_eq!(children.len(), 3);
+        } else {
+            panic!("Expected Codec::Union, got {:?}", result.codec());
+        }
+    }
+
+    /// Test that parser defaults to Dense mode when no metadata is present.
+    #[test]
+    fn test_parse_union_metadata_default_dense() {
+        let union_variants = vec![
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::Int)),
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
+        ];
+
+        let schema = Schema::Union(union_variants);
+
+        let mut maker = Maker::new(false, false);
+        let result = maker.make_data_type(&schema, None, None).unwrap();
+
+        if let Codec::Union(children, union_fields, mode) = result.codec() {
+            // Mode should default to Dense
+            assert_eq!(
+                *mode,
+                UnionMode::Dense,
+                "Expected UnionMode::Dense as default"
+            );
+
+            // Type IDs should be sequential [0, 1, 2]
+            let type_ids: Vec<i8> = union_fields.iter().map(|(tid, _)| tid).collect();
+            assert_eq!(type_ids, vec![0, 1, 2], "Type IDs should be sequential");
+
+            assert_eq!(children.len(), 3);
+        } else {
+            panic!("Expected Codec::Union, got {:?}", result.codec());
+        }
+    }
+
+    /// Test that invalid arrowUnionTypeIds (wrong length) produces an error.
+    #[test]
+    fn test_parse_union_metadata_type_ids_length_mismatch_errors() {
+        use serde_json::json;
+
+        let mut int_attrs = Attributes::default();
+        int_attrs
+            .additional
+            .insert("arrowUnionMode", json!("Sparse"));
+        // Length 2 but union has 3 variants - should error
+        int_attrs
+            .additional
+            .insert("arrowUnionTypeIds", json!([42, 7]));
+
+        let union_variants = vec![
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
+            Schema::Type(Type {
+                r#type: TypeName::Primitive(PrimitiveType::Int),
+                attributes: int_attrs,
+            }),
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
+        ];
+
+        let schema = Schema::Union(union_variants);
+
+        let mut maker = Maker::new(false, false);
+        let result = maker.make_data_type(&schema, None, None);
+
+        assert!(
+            result.is_err(),
+            "Expected error for mismatched type IDs length"
+        );
+    }
+
+    /// Test that invalid arrowUnionMode value produces an error.
+    #[test]
+    fn test_parse_union_metadata_mode_invalid_errors() {
+        use serde_json::json;
+
+        let mut int_attrs = Attributes::default();
+        int_attrs
+            .additional
+            .insert("arrowUnionMode", json!("Invalid"));
+
+        let union_variants = vec![
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::Null)),
+            Schema::Type(Type {
+                r#type: TypeName::Primitive(PrimitiveType::Int),
+                attributes: int_attrs,
+            }),
+            Schema::TypeName(TypeName::Primitive(PrimitiveType::String)),
+        ];
+
+        let schema = Schema::Union(union_variants);
+
+        let mut maker = Maker::new(false, false);
+        let result = maker.make_data_type(&schema, None, None);
+
+        assert!(
+            result.is_err(),
+            "Expected error for invalid union mode value"
+        );
+    }
+
+    /// Test that JSON-parsed union schemas extract metadata correctly.
+    /// This verifies the entire roundtrip: Arrow → Avro JSON → Schema → Codec
+    #[test]
+    fn test_parse_union_metadata_from_json_roundtrip() {
+        use crate::schema::AvroSchema;
+        use arrow_schema::{
+            DataType, Field as ArrowField, Schema as ArrowSchema, UnionFields, UnionMode,
+        };
+        use std::sync::Arc;
+
+        // Create an Arrow schema with a sparse union
+        let uf: UnionFields = vec![
+            (10i8, Arc::new(ArrowField::new("a", DataType::Int32, false))),
+            (20i8, Arc::new(ArrowField::new("b", DataType::Utf8, false))),
+        ]
+        .into_iter()
+        .collect();
+        let union_dt = DataType::Union(uf, UnionMode::Sparse);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("u", union_dt, false)]);
+
+        // Convert to Avro schema
+        let avro_schema =
+            AvroSchema::try_from(&arrow_schema).expect("Arrow to Avro schema conversion");
+
+        // Parse the JSON back to Schema
+        let parsed: crate::schema::Schema =
+            serde_json::from_str(&avro_schema.json_string).expect("Parse Avro JSON to Schema");
+
+        // Extract the union from the parsed schema (it's in a record)
+        if let crate::schema::Schema::Complex(crate::schema::ComplexType::Record(r)) = parsed {
+            let union_field = r.fields.iter().find(|f| f.name == "u").expect("field u");
+            if let crate::schema::Schema::Union(variants) = &union_field.r#type {
+                // Now extract layout from the variants
+                let (mode, type_ids_opt) =
+                    extract_union_layout(variants).expect("extract_union_layout should succeed");
+
+                assert_eq!(mode, UnionMode::Sparse, "Mode should be Sparse");
+                assert_eq!(
+                    type_ids_opt,
+                    Some(vec![10i8, 20i8]),
+                    "Type IDs should be [10, 20]"
+                );
+            } else {
+                panic!(
+                    "Expected union type for field u, got {:?}",
+                    union_field.r#type
+                );
+            }
+        } else {
+            panic!("Expected record schema, got {:?}", parsed);
+        }
     }
 }
